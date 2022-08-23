@@ -1,0 +1,732 @@
+---
+title: "A Stroking Analysis of Strokes"
+author: "Hunter Blum, Ben Earnest, Andrew Pak Kim"
+date: "4/12/2022"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Dataset:
+
+https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset
+
+# Libraries
+```{r}
+library(randomForest)
+library(caret)
+library(NeuralNetTools)
+library(nnet)
+library(doParallel)
+library(DataExplorer)
+library(Boruta)
+library(rpart)
+library(rpart.plot)
+library(gridExtra)
+library(e1071)
+library(kableExtra)
+library(tidyverse)
+
+
+set.seed(123)
+```
+
+# Data
+```{r}
+Stroke <- read.csv("stroke.csv")
+```
+
+# Multicore Support - Need to have Java Installed that is the same bit as your CPU (Probably 64)
+```{r}
+registerDoParallel()
+getDoParWorkers()
+```
+
+# Cleaning the Data
+
+The data is pretty clean after running this code. All variables are the correct type after running it. The only variable missing data is BMI, which only has 200/5100 observations missing. 
+
+## Structure
+```{r}
+str(Stroke)
+
+#Get rid of one other observation in gender
+Stroke <- Stroke %>% filter(gender!="Other")
+
+#Fix specific variables
+Stroke$hypertension <- as.factor(Stroke$hypertension)
+Stroke$heart_disease <- as.factor(Stroke$heart_disease)
+Stroke$bmi <- as.numeric(Stroke$bmi)
+Stroke$stroke <- as.factor(Stroke$stroke)
+
+#Make all character variables into factors
+Stroke[sapply(Stroke, is.character)] <- lapply(Stroke[sapply(Stroke, is.character)], as.factor)
+
+
+str(Stroke)
+
+#Rename Factors for Easier Understanding
+levels(Stroke$hypertension) <- c("No", "Yes")
+levels(Stroke$heart_disease) <- c("No", "Yes")
+levels(Stroke$stroke) <- c("No", "Yes")
+
+#Get Rid of id
+Stroke$id <- NULL
+```
+## NAs
+```{r}
+Stroke %>% 
+  select(everything()) %>% 
+  summarise_all(funs(sum(is.na(.))))
+#Just 201 missing observations in bmi 
+
+#We'll just delete the NAs for now
+Stroke_clean <- na.omit(Stroke)
+```
+
+
+
+# Exploratory Data Analysis
+
+Our target feature is stroke, where 1 indicates that a stroke occurred. For any binary attributes 1 is always the variable occurred (eg. 1 for heart disease means the patient had heart disease). 
+
+## Dataset Overview
+```{r}
+summary(Stroke_clean)
+head(Stroke_clean)
+```
+
+
+## Variable by Stroke
+### Make Functions
+```{r}
+#Categorical
+Cat_eda <- function(x, y) {
+  p1 <- ggplot(Stroke_clean, aes(x={{x}})) +
+    geom_bar(aes(fill=stroke) , color = "black") +
+    ggtitle(paste0("Stroke with Respect to ", y)) +
+    xlab(y) + ylab("Count")
+
+  p2 <- ggplot(Stroke_clean, aes(x={{x}})) +
+    geom_bar(aes(fill=stroke), position = "fill", color = "black") + ggtitle(paste0("Stroke with Respect to ",y, " (Normalized)")) + xlab(y) + ylab("Count")
+  
+  plot(p1)
+  plot(p2)
+}
+
+#Numeric
+Num_eda <- function(x, y) {
+  p1 <- ggplot(Stroke_clean, aes(x={{x}})) +
+    geom_histogram(aes(fill=stroke), color = "black") +
+    ggtitle(paste0("Stroke with Respect to ", y)) +
+    xlab(y) + ylab("Count")
+
+ p2 <- ggplot(Stroke_clean, aes(x={{x}})) +  
+   geom_histogram(aes(fill=stroke), color = "black", position =      "fill") +
+   ggtitle(paste0("Stroke with Respect to ", y, " (Normalized)")) +
+   xlab(y) + ylab("Count")
+ 
+ plot(p1)
+ plot(p2)
+  
+}
+
+```
+
+
+### Categorical Variables
+```{r}
+Cat_eda(gender, "Gender")
+Cat_eda(hypertension, "Hypertension")
+Cat_eda(heart_disease, "Heart Disease")
+Cat_eda(ever_married, "Ever Married")
+Cat_eda(work_type, "Work Type")
+Cat_eda(Residence_type, "Residence Type")
+Cat_eda(smoking_status, "Smoking Status")
+``` 
+
+### Numeric variables
+```{r}
+Num_eda(age, "Age")
+Num_eda(avg_glucose_level, "Avg. Glucose Level")
+Num_eda(bmi, "BMI")
+```
+
+### Correlation Matrix
+```{r}
+plot_correlation(Stroke)
+```
+
+# Data Preparation for modelling
+
+## Partition Data 
+```{r}
+#Partition Data
+trainIndex <- createDataPartition(y=Stroke_clean$stroke, p=0.8, list = F, times = 1)
+
+Stroke_tr <- Stroke_clean[trainIndex, ]
+Stroke_test <- Stroke_clean[-trainIndex, ]
+```
+
+
+### Visualize Stroke Balance in Training 
+```{r}
+#Dual Axis
+ggplot(Stroke_tr, aes(x=stroke)) + 
+  geom_bar(fill = "#eb746c") +
+  scale_y_continuous(
+    name = "Count",
+    sec.axis = sec_axis(~./nrow(Stroke_tr), name = "Proportion")
+  ) + ggtitle("Training Data Pre-balancing")
+```
+
+### Oversampling
+```{r}
+#Get count of yes in training
+minority <- Stroke_tr %>% group_by(stroke) %>% tally() %>% filter(stroke =="Yes")
+
+#Change this to change balance to desired yes proportion
+increase_to <- 0.5
+
+#Calculate resample amouunt
+oversample_n <- (increase_to*nrow(Stroke_tr)-minority$n)/(1-increase_to)
+
+#Resample
+to_oversample <- which(Stroke_tr$stroke == "Yes")
+our_oversample <- sample(x = to_oversample, size = oversample_n, replace = T)
+our_oversample <- Stroke_tr[our_oversample, ]
+Stroke_over <- rbind(Stroke_tr, our_oversample)
+
+#Evaluate
+ggplot(Stroke_over, aes(x=stroke)) + 
+  geom_bar(fill = "#72cf69") +
+  scale_y_continuous(
+    name = "Count",
+    sec.axis = sec_axis(~./nrow(Stroke_over), name = "Proportion")
+  )  + ggtitle("Oversampled Data")
+```
+
+
+
+
+## Standardization
+### Min-Max Standardization Function - Use standard.df() to create your own data set for model if you feel standardization is necessary.
+```{r}
+#Function to Standardize One Variable
+standard.mm <- function(x){
+  (x - min(x)) / (max(x) - min(x))
+}
+
+#Function to Standardize all Numeric Variables in Data Frame
+standard.mm.df <- function(x){
+  #Split Data
+  tr_num <- x %>% select(where(is.numeric))
+  tr_non <- x %>% select(!where(is.numeric))
+  
+  #Run Standardization Function Across Numeric
+  tr_num_mm <- apply(X = tr_num, FUN = standard.mm, MARGIN = 2)
+  
+  #Recombine
+  tr_mm <- cbind(tr_non, tr_num_mm)
+}
+
+```
+
+### Z-Score Standardization
+```{r}
+#Z-Score Function
+standard.z <- function(x){
+  (x-mean(x))/sd(x)
+}
+
+#Function to Standardize all Numeric Variables in Data Frame
+standard.z.df <- function(x){
+  #Split Data
+  tr_num <- x %>% select(where(is.numeric))
+  tr_non <- x %>% select(!where(is.numeric))
+  
+  #Run Standardization Function Across Numeric
+  tr_num_mm <- apply(X = tr_num, FUN = standard.z, MARGIN = 2)
+  
+  #Recombine
+  tr_mm <- cbind(tr_non, tr_num_mm)
+}
+
+```
+
+### Feature Selection
+```{r}
+# Run the boruta
+Stroke_over_z <- standard.z.df(Stroke_over)
+
+boruta_out <- Boruta(stroke ~ ., data = Stroke_over_z, doTrace = 2)
+
+boruta_sig <- getSelectedAttributes(boruta_out, withTentative = T)
+
+print(boruta_sig)
+
+imps <- attStats(boruta_out)
+imps2 = imps[imps$decision != 'Rejected', c('meanImp', 'decision')]
+imps2[order(-imps2$meanImp), ]
+
+plot(boruta_out, cex.axis=.55, las=2, xlab="", main="Variable Importance")  
+
+
+# All Variables were deemed important
+```
+
+# Modeling
+## C5.0 - Andrew
+```{r}
+library(C50)
+C5 <- C5.0(formula = stroke ~ . , data = Stroke_over, control = C5.0Control(minCases = 75))
+```
+
+```{r}
+#Visualize the tree
+plot(C5)
+```
+
+```{r}
+#Create a data frame that includes the predictor variables of the records to classify.
+X = Stroke_over %>% select(!stroke)
+```
+
+```{r}
+#Obtain model diagnostics
+C5_bal <- confusionMatrix(data = predict(C5, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+C5_bal
+```
+
+
+## CART - Ben
+
+### Run CART decision tree model:
+```{r}
+cart01 <- rpart(formula = stroke ~ ., data = Stroke_over, method = "class")
+rpart.plot(cart01)
+```
+
+### Evaluate Model on Train and Test Data
+```{r}
+train_cart <- confusionMatrix(data = predict(cart01, Stroke_over, type = "class"), ref = Stroke_over$stroke, positive = "Yes")
+train_cart
+
+cart_bal <- confusionMatrix(data = predict(cart01, Stroke_test, type = "class"), ref = Stroke_test$stroke, positive = "Yes")
+cart_bal
+```
+
+### Cost Sensitive CARET - 
+Probably only useful if we want to hyperfocus on sensitivity, but loses a lot of specificity.
+```{r}
+cost <- matrix(c(
+  0, 1,
+  10, 0
+), byrow = TRUE, nrow = 2)
+cost
+```
+### Create cost sensitive model
+```{r}
+train <- createFolds(Stroke_tr$stroke, k=10)
+
+cart_stroke <- caret::train(stroke~., method="rpart", data = Stroke_tr, tuneLength = 5, parms = list(loss = cost),trControl = trainControl(
+  method = "cv", indexOut = train
+))
+
+cart_stroke
+
+cart_stroke_bal <- caret::train(stroke~., method="rpart", data = Stroke_over, tuneLength = 5, parms = list(loss = cost),trControl = trainControl(
+  method = "cv", indexOut = train
+))
+
+cart_stroke_bal
+```
+
+### Evaluate
+```{r}
+cart_cost <- confusionMatrix(data = predict(cart_stroke, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+cart_cost
+
+cart_cost_bal <- confusionMatrix(data = predict(cart_stroke_bal, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+cart_cost_bal
+```
+
+## Logistic Regression - Ben
+
+```{r}
+#unbalanced
+Stroke_tr_z_lr <- standard.z.df(Stroke_tr)
+logreg_stroke <- glm(formula = stroke ~ ., data = Stroke_tr_z_lr, family = binomial)
+summary(logreg_stroke)
+
+#balanced
+Stroke_tr_z_bal_lr <- standard.z.df(Stroke_over)
+logreg01_stroke <- glm(formula = stroke ~ ., data = Stroke_tr_z_bal_lr, family = binomial)
+summary(logreg01_stroke)
+```
+### Remove variables with a p-value < .05:
+
+```{r}
+head(Stroke_tr_z_bal_lr)
+```
+### Retrain model
+```{r}
+Stroke_logreg_df <- subset(Stroke_tr_z_bal_lr, select = c("gender", "hypertension", "heart_disease", "smoking_status", "age", "avg_glucose_level", "stroke"))
+
+logreg_stroke_subset <- glm(formula = stroke ~ ., data = Stroke_logreg_df, family = binomial)
+summary(logreg_stroke_subset)
+```
+### Compare the logreg predictions to the test dataset target variables. 
+```{r}
+#Create Test Subset
+Stroke_logreg_test <- Stroke_test %>% select(gender, hypertension, heart_disease, smoking_status, age, avg_glucose_level, stroke)
+# prediction
+Stroke_logreg_test$pred_prob <- predict(object = logreg_stroke_subset, newdata = Stroke_logreg_test, type='response')
+Stroke_logreg_test$pred <- (Stroke_logreg_test$pred_prob > 0.5)*1
+
+# Change pred variables to y/n
+Stroke_logreg_test$pred[Stroke_logreg_test$pred=="1"]<-"Yes"
+Stroke_logreg_test$pred[Stroke_logreg_test$pred=="0"]<-"No"
+Stroke_logreg_test$pred <- as.factor(Stroke_logreg_test$pred)
+
+
+```
+
+### Confusion Matrix and Metrics
+```{r}
+LogReg <- confusionMatrix(data = Stroke_logreg_test$pred, ref = Stroke_logreg_test$stroke, positive = "Yes")
+LogReg
+```
+
+## Random Forest - Hunter
+### Create Models
+```{r}
+train <- createFolds(Stroke_tr$stroke, k=10)
+
+rf_stroke <- caret::train(stroke~., method="rf", data = Stroke_tr, tuneLength = 5, trControl = trainControl(
+  method = "cv", indexOut = train, classProbs = TRUE
+))
+
+rf_stroke
+
+train <- createFolds(Stroke_over_z$stroke, k=10)
+
+rf_stroke_bal <- caret::train(stroke~., method="rf", data = Stroke_over_z, tuneLength = 5,  trControl = trainControl(
+  method = "cv", indexOut = train
+))
+
+
+rf_stroke_bal
+rf_stroke_bal$finalModel
+```
+
+
+
+### Confusion Matrices
+```{r}
+rf_reg <- confusionMatrix(data = predict(rf_stroke, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+rf_reg
+
+rf_bal <- confusionMatrix(data = predict(rf_stroke_bal, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+rf_bal
+```
+
+
+## Naive Bayes - Andrew
+
+### Create the tables that will allow calculation of necessary probabilities 
+
+#### Table Function
+```{r}
+#For any individual dataset
+#x = data set, y = non stroke variable
+nb_table <- function(x, y) {
+  gen <- table(x[,"stroke"], x[,y])
+  colnames(gen) <- levels(x[,y])
+  rownames(gen) <- c("stroke = Yes", "stroke = No")
+  names(dimnames(gen)) <- list(" ", y)
+  addmargins(A = gen, FUN = list(Total = sum), quiet = TRUE)
+} 
+
+```
+
+
+#### First table is the contingency table of "stroke" and "gender". The value 1 indicates "yes" while 0 indicates "no."
+
+
+```{r}
+nb_table(Stroke_over, "gender")
+```
+
+#### Second table is the contingency table of "stroke" and "hypertension". The value 1 indicates "yes" while 0 indicates "no."
+```{r}
+nb_table(Stroke_over, "hypertension")
+```
+
+#### Third table is the contingency table of "stroke" and "heart disease". The value 1 indicates "yes" while 0 indicates "no."
+```{r}
+nb_table(Stroke_over, "heart_disease")
+```
+
+#### Fourth table is the contingency table of "stroke" and "ever married". 
+```{r}
+nb_table(Stroke_over, "ever_married")
+```
+
+#### Fifth table is the contingency table of "stroke" and "residence type".
+```{r}
+nb_table(Stroke_over, "Residence_type")
+```
+
+#### Sixth table is the contingency table of "stroke" and "smoking status".
+```{r}
+nb_table(Stroke_over, "smoking_status")
+```
+
+#### Seventh table is the contingency table of "stroke" and "work type".
+```{r}
+nb_table(Stroke_over, "work_type")
+```
+
+### Gridlines for each variable in association with "stroke".
+
+#### Plot Function 
+```{r}
+nb_plot <- function(x, y){
+  ggplot(x, aes(stroke)) + geom_bar(aes(fill=x[,y]), position = "fill", color = "black") + ylab("Proportion") + labs(fill = y)
+}
+```
+
+#### Graphs of "stroke" in association with "gender" and "hyptertension".
+
+```{r}
+grid.arrange(nb_plot(Stroke_over, "gender"), nb_plot(Stroke_over,"hypertension"), nrow = 1)
+```
+
+#### Run the Naive Bayes estimator for "stroke" in association with "gender" and "hypertension".
+```{r}
+nb01 <- naiveBayes(formula = stroke ~ gender + hypertension, data = Stroke_over)
+
+nb_gender <- confusionMatrix(data = predict(nb01, Stroke_test, type = "class"), ref = Stroke_test$stroke, positive = "Yes")
+nb_gender
+```
+
+#### Graphs of "stroke" in association with "heart disease" and "ever married".
+```{r}
+grid.arrange(nb_plot(Stroke_over, "heart_disease"), nb_plot(Stroke_over,"ever_married"), nrow = 1)
+```
+
+#### Run the Naive Bayes estimator for "stroke" in association with "heart disease" and "ever married".
+```{r}
+nb02 <- naiveBayes(formula = stroke ~ heart_disease + ever_married, data = Stroke_over)
+
+nb_heart_marry <- confusionMatrix(data = predict(nb02, Stroke_test, type = "class"), ref = Stroke_test$stroke, positive = "Yes")
+nb_heart_marry
+```
+
+#### Graph of "stroke" in association with "Residence type".
+```{r}
+grid.arrange(nb_plot(Stroke_over, "Residence_type"))
+```
+
+#### Run the Naive Bayes estimator for "stroke" in association with "Residence type".
+```{r}
+nb03 <- naiveBayes(formula = stroke ~ Residence_type, data = Stroke_over)
+
+nb_Res <- confusionMatrix(data = predict(nb03, Stroke_test, type = "class"), ref = Stroke_test$stroke, positive = "Yes")
+nb_Res
+```
+
+#### Graph of "stroke" in association with "smoking status" and "work type".
+```{r}
+grid.arrange(nb_plot(Stroke_over, "smoking_status"), nb_plot(Stroke_over, "work_type"), nrow = 1)
+```
+
+#### Run the Naive Bayes estimator for "stroke" in association with "smoking status" and "work type".
+```{r}
+nb04 <- naiveBayes(formula = stroke ~ smoking_status + work_type, data = Stroke_over)
+
+nb_smoke_work <- confusionMatrix(data = predict(nb04, Stroke_test, type = "class"), ref = Stroke_test$stroke, positive = "Yes")
+nb_smoke_work
+```
+
+
+
+## Neural Network - Hunter
+
+### Fitting Models
+```{r}
+#Unbalanced
+train <- createFolds(Stroke_tr$stroke, k=10)
+
+nnet_stroke <- caret::train(stroke ~ ., method = "nnet", data = Stroke_tr,
+    tuneLength = 5,
+    trControl = trainControl(
+        method = "cv", indexOut = train),
+  trace = FALSE)   
+                     
+nnet_stroke
+
+nnet_stroke$finalModel
+plotnet(nnet_stroke$finalModel, pad_x = 0.25)
+
+#Balanced
+
+train <- createFolds(Stroke_over$stroke, k=10)
+
+nnet_stroke_balanced <- caret::train(stroke ~ ., method = "nnet", data = Stroke_over,
+    tuneLength = 5,
+    trControl = trainControl(
+        method = "cv", indexOut = train),
+  trace = FALSE)   
+   
+nnet_stroke_balanced
+plotnet(nnet_stroke_balanced$finalModel, pad_x = 0.25, circle_col = c("#F784FF", "#F784FF"))
+
+#Z-Score Standardized
+
+Stroke_tr_z_nnet <- standard.z.df(Stroke_tr)
+
+train <- createFolds(Stroke_tr_z_nnet$stroke, k=10)
+
+
+nnet_stroke_z <- caret::train(stroke ~ ., method = "nnet", data = Stroke_tr_z_nnet,
+    tuneLength = 5,
+    trControl = trainControl(
+        method = "cv", indexOut = train),
+  trace = FALSE)   
+   
+nnet_stroke_z
+plotnet(nnet_stroke_z$finalModel, pad_x = 0.25, circle_col = c("#FF9984", "#FF9984"))
+
+#Z-score standardized and balanced
+
+Stroke_tr_z_bal <- standard.z.df(Stroke_over)
+
+train <- createFolds(Stroke_tr_z_nnet$stroke, k=10)
+
+
+nnet_stroke_z_bal <- caret::train(stroke ~ ., method = "nnet", data = Stroke_over,
+    tuneLength = 5,
+    trControl = trainControl(
+        method = "cv", indexOut = train),
+  trace = FALSE)   
+   
+nnet_stroke_z_bal
+plotnet(nnet_stroke_z_bal$finalModel, pad_x = 0.25, circle_col= c("#90F88D", "#90F88D"))
+
+### Evaluate NN
+```{r}
+nnet_reg <- confusionMatrix(data = predict(nnet_stroke, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+nnet_reg
+
+nnet_bal <- confusionMatrix(data = predict(nnet_stroke_balanced, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+nnet_bal
+
+nnet_z <- confusionMatrix(data = predict(nnet_stroke_z, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+nnet_z
+
+nnet_z_bal <- confusionMatrix(data = predict(nnet_stroke_z_bal, Stroke_test), ref = Stroke_test$stroke, positive = "Yes")
+nnet_z_bal
+```
+
+
+# Model Evaluation
+## Add Baseline
+```{r}
+Stroke_count <- Stroke_test %>% group_by(stroke) %>% tally()
+Stroke_count
+
+TN <- as.numeric(Stroke_count[1,2])
+FN <- as.numeric(Stroke_count[2,2])
+TP <- 0
+FP <- 0
+
+Accuracy_base <- TN/(TN+FN)
+Sensitivity_base <- TP/(TP+FN)
+Specificity_base<- TN/(TN+FP)
+Precision_base <- TP/(TP+FP)
+F1_base <- 0
+
+Baseline <- c(Accuracy_base, Sensitivity_base, Specificity_base, Precision_base, F1_base)
+```
+
+
+## Model Comparison Data Frame
+```{r}
+#Models
+"ANN Reg." <- c(nnet_reg$overall, nnet_reg$byClass)
+"ANN Bal." <- c(nnet_bal$overall, nnet_bal$byClass)
+"ANN Z" <- c(nnet_z$overall, nnet_z$byClass)
+"ANN Z Bal." <- c(nnet_z_bal$overall, nnet_z_bal$byClass)
+"RF Reg." <- c(rf_reg$overall, rf_reg$byClass)
+"RF Bal." <- c(rf_bal$overall, rf_bal$byClass)
+"CART Bal." <- c(cart_bal$overall, cart_bal$byClass)
+"C5.0 Bal." <- c(C5_bal$overall, C5_bal$byClass)
+"NB Gender" <- c(nb_gender$overall, nb_gender$byClass)
+"NB Heart + Marry" <- c(nb_heart_marry$overall, nb_heart_marry$byClass)
+"NB Resident" <- c(nb_Res$overall, nb_Res$byClass)
+"NB Smoke + Work" <- c(nb_smoke_work$overall, nb_smoke_work$byClass)
+"CART Cost" <- c(cart_cost$overall, cart_cost$byClass)
+"CART Cost Bal." <- c(cart_cost_bal$overall, cart_cost_bal$byClass)
+"Log Reg." <- c(LogReg$overall, LogReg$byClass)
+
+
+Model_comp <- rbind(`ANN Reg.`, `ANN Bal.`, `ANN Z`, `ANN Z Bal.`, `RF Reg.`, `RF Bal.`, `CART Bal.`, `CART Cost`, `CART Cost Bal.`, `C5.0 Bal.`, `NB Gender`, `NB Heart + Marry`, `NB Resident`, `NB Smoke + Work`, `Log Reg.`)
+
+Model_comp <- data.frame(Model_comp)
+
+Model_comp <- Model_comp %>% dplyr::select(Accuracy, Sensitivity, Specificity, Precision, F1)
+
+Model_comp <- rbind(Baseline , Model_comp)
+
+rownames(Model_comp)[rownames(Model_comp) == 1] <- "Baseline"
+
+Model_comp <- cbind(Model = rownames(Model_comp), Model_comp)
+rownames(Model_comp) <- 1:nrow(Model_comp)
+
+Model_comp$Model <- as.factor(Model_comp$Model)
+Model_comp[is.na(Model_comp)] <- 0
+```
+
+## Accuracy Graph
+```{r}
+Plot_acc <- Model_comp %>% mutate(Model = fct_reorder(Model, desc(Accuracy))) %>% mutate(Performance = ifelse(Model_comp$Accuracy == Accuracy_base, "Baseline", ifelse(Model_comp$Accuracy < Accuracy_base, "Worse", "Better"))) %>% ggplot(aes(x=Model, y=Accuracy, fill = Performance)) + geom_bar(stat = "identity") + coord_flip() + scale_fill_manual(values = c("grey", "#c12503", "darkgreen"))
+plot(Plot_acc)
+```
+
+## Sensitivity
+```{r}
+Plot_sens <- Model_comp %>% mutate(Model = fct_reorder(Model, desc(Sensitivity))) %>% mutate(Performance = ifelse(Model_comp$Sensitivity == Sensitivity_base, "Baseline", ifelse(Model_comp$Sensitivity < Sensitivity_base, "Worse", "Better"))) %>% 
+  ggplot(aes(x=Model, y=Sensitivity, fill = Performance)) + geom_bar(stat = "identity") + coord_flip() + scale_fill_manual(values = c("Grey", "darkgreen"))
+plot(Plot_sens)
+```
+## Side by side for paper
+```{r}
+grid.arrange(Plot_acc, Plot_sens, ncol = 2)
+```
+## Specificity 
+```{r}
+Model_comp %>% mutate(Model = fct_reorder(Model, desc(Specificity))) %>% mutate(Performance = ifelse(Model_comp$Specificity == Specificity_base, "Baseline", ifelse(Model_comp$Specificity < Specificity_base, "Worse", "Better"))) %>% 
+  ggplot(aes(x=Model, y=Specificity, fill = Performance)) + geom_bar(stat = "identity") + coord_flip() + scale_fill_manual(values = c("Grey", "#c12503"))
+```
+
+## Precision
+```{r}
+Model_comp %>% mutate(Model = fct_reorder(Model, desc(Precision))) %>% mutate(Performance = ifelse(Model_comp$Precision == 0, "Baseline", ifelse(Model_comp$Precision < 0, "Worse", "Better"))) %>% ggplot(aes(x=Model, y=Precision, fill = Performance)) + geom_bar(stat = "identity") + coord_flip() + scale_fill_manual(values = c("Grey", "darkgreen"))
+```
+
+## F1
+```{r}
+Model_comp %>% mutate(Model = fct_reorder(Model, desc(F1))) %>% mutate(Performance = ifelse(Model_comp$F1 == F1_base, "Baseline", ifelse(Model_comp$F1 < F1_base, "Worse", "Better"))) %>% 
+  ggplot(aes(x=Model, y=F1, fill = Performance)) + geom_bar(stat = "identity") + coord_flip() + scale_fill_manual(values = c("Grey", "darkgreen"))
+```
+
+## Comparison Table
+```{r}
+Model_comp
+```
